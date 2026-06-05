@@ -2,7 +2,12 @@
 """
 Double-Clap Detector
 On two claps: opens Claude Code on the last project
-              and plays Back in Black on Yandex Music.
+              and plays Back in Black by AC/DC via Yandex Music API.
+
+Token setup (first run):
+  python3 clap_detector.py --setup-token
+Or set env var:
+  export YANDEX_TOKEN=<your_token>
 """
 
 import numpy as np
@@ -11,6 +16,8 @@ import subprocess
 import time
 import threading
 import os
+import sys
+import json
 from collections import deque
 from pathlib import Path
 
@@ -23,24 +30,141 @@ CLAP_WINDOW    = 1.8    # seconds: both claps must land in this window
 MIN_CLAP_GAP   = 0.12   # seconds: ignore echoes closer than this
 COOLDOWN       = 3.5    # seconds: silence detector after a successful trigger
 
-YANDEX_URL = (
-    "https://music.yandex.ru/search?text=AC%2FDC+Back+in+Black"
-)
+TRACK_QUERY    = "AC/DC Back in Black"
+TOKEN_FILE     = Path.home() / ".config" / "clap_detector" / "token.json"
+
+# Fallback browser URL if API/player unavailable
+YANDEX_URL     = "https://music.yandex.ru/search?text=AC%2FDC+Back+in+Black"
 # ──────────────────────────────────────────────────────────────────────────────
 
-_clap_times: deque      = deque(maxlen=20)
-_last_clap:  float      = 0.0
-_last_fire:  float      = 0.0
-_lock                   = threading.Lock()
+_clap_times: deque = deque(maxlen=20)
+_last_clap:  float = 0.0
+_last_fire:  float = 0.0
+_lock              = threading.Lock()
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Token management ─────────────────────────────────────────────────────────
+
+def _load_token() -> str | None:
+    if token := os.environ.get("YANDEX_TOKEN"):
+        return token.strip()
+    if TOKEN_FILE.exists():
+        try:
+            data = json.loads(TOKEN_FILE.read_text())
+            return data.get("token", "").strip() or None
+        except Exception:
+            pass
+    return None
+
+
+def _save_token(token: str):
+    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(json.dumps({"token": token}))
+    TOKEN_FILE.chmod(0o600)
+
+
+def setup_token():
+    """Interactive token setup wizard."""
+    print()
+    print("  Настройка токена Яндекс Музыки")
+    print("  ─────────────────────────────────────────────────────")
+    print("  1. Открой в браузере:")
+    print("     https://oauth.yandex.ru/authorize?response_type=token"
+          "&client_id=23cabbbdc6cd418abb4b39c32c41195d")
+    print()
+    print("  2. Войди в аккаунт и разреши доступ.")
+    print("  3. Скопируй токен из URL (параметр access_token=...)")
+    print()
+    token = input("  Вставь токен: ").strip()
+    if not token:
+        print("  Токен не введён — выход.")
+        sys.exit(1)
+    _save_token(token)
+    print(f"  ✓ Сохранено в {TOKEN_FILE}")
+    print()
+
+
+# ─── Music playback ───────────────────────────────────────────────────────────
+
+def _get_stream_url(token: str) -> str | None:
+    """Use yandex-music library to resolve a direct stream URL for the track."""
+    try:
+        from yandex_music import Client  # type: ignore
+    except ImportError:
+        return None
+
+    try:
+        client = Client(token).init()
+        results = client.search(TRACK_QUERY, type_="track")
+        if not results or not results.tracks or not results.tracks.results:
+            print("  ✗ Трек не найден через API")
+            return None
+
+        track = results.tracks.results[0]
+        title = f"{track.artists[0].name if track.artists else '?'} – {track.title}"
+        print(f"  → Найдено: {title}")
+
+        infos = track.get_download_info()
+        if not infos:
+            return None
+        # Pick highest bitrate
+        best = max(infos, key=lambda x: x.bitrate_in_kbps)
+        return best.get_direct_link()
+    except Exception as exc:
+        print(f"  ✗ Ошибка API: {exc}")
+        return None
+
+
+def _play_url(url: str) -> bool:
+    """Play an audio URL with the first available system player."""
+    players = [
+        ["mpv", "--no-video", url],
+        ["vlc", "--intf", "dummy", url],
+        ["ffplay", "-nodisp", "-autoexit", url],
+        ["mplayer", url],
+    ]
+    for cmd in players:
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"  → Воспроизводит: {cmd[0]}")
+            return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
+def _play_track():
+    token = _load_token()
+
+    if token:
+        url = _get_stream_url(token)
+        if url and _play_url(url):
+            return
+        print("  ⚠ Не удалось воспроизвести через API, открываю браузер…")
+    else:
+        print("  ⚠ Токен не настроен (запусти --setup-token), открываю браузер…")
+
+    # Browser fallback
+    for cmd in (
+        ["xdg-open",         YANDEX_URL],
+        ["sensible-browser", YANDEX_URL],
+        ["firefox",          YANDEX_URL],
+        ["google-chrome",    YANDEX_URL],
+    ):
+        try:
+            subprocess.Popen(cmd)
+            print(f"  → Яндекс Музыка в браузере")
+            return
+        except FileNotFoundError:
+            continue
+    import webbrowser
+    webbrowser.open(YANDEX_URL)
+
+
+# ─── Claude Code ──────────────────────────────────────────────────────────────
 
 def _find_last_claude_project() -> str | None:
-    """Return the path of the most recently used Claude Code project."""
     home = Path.home()
-
-    # ~/.claude/projects/<encoded-path>/  — each dir is one project session
     projects_root = home / ".claude" / "projects"
     if projects_root.is_dir():
         candidates = sorted(
@@ -49,62 +173,37 @@ def _find_last_claude_project() -> str | None:
             reverse=True,
         )
         for candidate in candidates:
-            # Claude encodes the real path: leading slash → empty token,
-            # remaining slashes → hyphens.  Reconstruct and verify.
-            raw = candidate.name
-            # encoded form: "-home-user-myproject"  →  "/home/user/myproject"
+            raw     = candidate.name
             decoded = raw.replace("-", "/")
             if not decoded.startswith("/"):
                 decoded = "/" + decoded
             if os.path.isdir(decoded):
                 return decoded
 
-    # Fallback: most recently touched dir in common locations
     for base in ("~/projects", "~/code", "~/dev", "~/workspace", "~"):
         base_path = Path(base).expanduser()
         if not base_path.is_dir():
             continue
-        dirs = [
-            d for d in base_path.iterdir()
-            if d.is_dir() and not d.name.startswith(".")
-        ]
+        dirs = [d for d in base_path.iterdir() if d.is_dir() and not d.name.startswith(".")]
         if dirs:
             return str(max(dirs, key=lambda d: d.stat().st_mtime))
-
     return None
 
 
 def _open_claude_code():
     project = _find_last_claude_project()
     cwd     = project if project and os.path.isdir(project) else None
-
     print(f"  → Claude Code  {('in ' + cwd) if cwd else '(no project found)'}")
-    for cmd in (["claude"], ["code", "--reuse-window", cwd or "."], ["cursor", cwd or "."]):
+    for cmd in (["claude"], ["code", "--reuse-window"], ["cursor"]):
         try:
-            subprocess.Popen(cmd if cwd is None else cmd[:1], cwd=cwd)
+            subprocess.Popen(cmd, cwd=cwd)
             return
         except FileNotFoundError:
             continue
-    print("  ✗ claude / code / cursor not found in PATH")
+    print("  ✗ claude / code / cursor не найдены в PATH")
 
 
-def _open_yandex_music():
-    print(f"  → Yandex Music  {YANDEX_URL}")
-    for cmd in (
-        ["xdg-open",         YANDEX_URL],
-        ["sensible-browser", YANDEX_URL],
-        ["firefox",          YANDEX_URL],
-        ["google-chrome",    YANDEX_URL],
-        ["chromium-browser", YANDEX_URL],
-    ):
-        try:
-            subprocess.Popen(cmd)
-            return
-        except FileNotFoundError:
-            continue
-    import webbrowser
-    webbrowser.open(YANDEX_URL)
-
+# ─── Trigger ─────────────────────────────────────────────────────────────────
 
 def _trigger():
     global _last_fire
@@ -112,14 +211,10 @@ def _trigger():
     print("  👏  👏   ДВОЙНОЙ ХЛОПОК — запускаем!")
     print("═" * 52)
 
-    threads = [
-        threading.Thread(target=_open_claude_code, daemon=True),
-        threading.Thread(target=_open_yandex_music, daemon=True),
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=6)
+    t1 = threading.Thread(target=_open_claude_code, daemon=True)
+    t2 = threading.Thread(target=_play_track,       daemon=True)
+    t1.start(); t2.start()
+    t1.join(timeout=8); t2.join(timeout=8)
 
     print("  ✓  Готово!\n")
     with _lock:
@@ -129,14 +224,10 @@ def _trigger():
 # ─── Audio callback ───────────────────────────────────────────────────────────
 
 def _is_clap(block: np.ndarray) -> bool:
-    """True when the block looks like a hand-clap transient."""
     peak = float(np.max(np.abs(block)))
     if peak < CLAP_THRESHOLD:
         return False
-    # Claps decay quickly: first quarter louder than last quarter
-    q = len(block) // 4
-    if q == 0:
-        return True
+    q    = len(block) // 4
     rise = float(np.max(np.abs(block[:q])))
     tail = float(np.max(np.abs(block[-q:])))
     return rise > tail * 0.5
@@ -159,10 +250,8 @@ def _audio_cb(indata: np.ndarray, frames: int, time_info, status):
         return
 
     with _lock:
-        gap = now - _last_clap
-        if gap < MIN_CLAP_GAP:
-            return  # echo / double-count guard
-
+        if now - _last_clap < MIN_CLAP_GAP:
+            return
         _last_clap = now
         _clap_times.append(now)
         recent = [t for t in _clap_times if now - t <= CLAP_WINDOW]
@@ -180,6 +269,12 @@ def _audio_cb(indata: np.ndarray, frames: int, time_info, status):
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
+    if "--setup-token" in sys.argv:
+        setup_token()
+        return
+
+    token_status = "✓ настроен" if _load_token() else "✗ не настроен (запусти --setup-token)"
+
     print()
     print("╔══════════════════════════════════════════════════╗")
     print("║   👏  Детектор двойного хлопка  👏              ║")
@@ -187,10 +282,10 @@ def main():
     print()
     print("  Два хлопка →")
     print("    1. Claude Code  (последний проект)")
-    print("    2. Back in Black  на Яндекс Музыке")
+    print("    2. AC/DC – Back in Black  (Яндекс Музыка)")
     print()
-    print(f"  threshold : {CLAP_THRESHOLD}   window : {CLAP_WINDOW}s"
-          f"   cooldown : {COOLDOWN}s")
+    print(f"  Токен YM  : {token_status}")
+    print(f"  threshold : {CLAP_THRESHOLD}   window : {CLAP_WINDOW}s   cooldown : {COOLDOWN}s")
     print()
     print("  Ctrl+C — остановить")
     print("─" * 52)
