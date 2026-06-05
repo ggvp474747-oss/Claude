@@ -64,23 +64,68 @@ def _save_token(token: str):
 
 
 def setup_token():
-    """Interactive token setup wizard."""
+    """Get Yandex Music OAuth token: tries Device Flow, falls back to manual URL."""
+    from yandex_music import Client  # type: ignore
+
     print()
-    print("  Настройка токена Яндекс Музыки")
-    print("  ─────────────────────────────────────────────────────")
-    print("  1. Открой в браузере:")
-    print("     https://oauth.yandex.ru/authorize?response_type=token"
-          "&client_id=23cabbbdc6cd418abb4b39c32c41195d")
+    print("  Авторизация Яндекс Музыки")
+    print("  ─────────────────────────────────────────")
+
+    client = Client()
+
+    # ── Method 1: Device Flow (works if Yandex doesn't block the host) ──────
+    def show_code(code):
+        print()
+        print(f"  Открой в браузере → {code.verification_url}")
+        print(f"  Введи код          → {code.user_code}")
+        print()
+        print(f"  Жду подтверждения ({code.expires_in // 60} мин)…")
+        for launcher in ("xdg-open", "sensible-browser", "firefox", "google-chrome"):
+            try:
+                subprocess.Popen([launcher, code.verification_url],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("  (браузер открыт автоматически)")
+                break
+            except FileNotFoundError:
+                continue
+
+    try:
+        oauth = client.device_auth(show_code, timeout=300)
+        _save_token(oauth.access_token)
+        print(f"\n  ✓ Токен получен и сохранён → {TOKEN_FILE}")
+        print()
+        return
+    except Exception:
+        pass  # fall through to manual method
+
+    # ── Method 2: Manual URL (universal fallback) ────────────────────────────
+    MANUAL_URL = (
+        "https://oauth.yandex.ru/authorize"
+        "?response_type=token"
+        "&client_id=23cabbbdc6cd418abb4b39c32c41195d"
+    )
     print()
-    print("  2. Войди в аккаунт и разреши доступ.")
-    print("  3. Скопируй токен из URL (параметр access_token=...)")
+    print("  Device Flow недоступен. Используем ручной способ:")
     print()
-    token = input("  Вставь токен: ").strip()
+    print(f"  1. Открой:  {MANUAL_URL}")
+    print("  2. Войди в Яндекс и разреши доступ.")
+    print("  3. Скопируй значение  access_token=...  из адресной строки.")
+    print()
+    for launcher in ("xdg-open", "sensible-browser", "firefox", "google-chrome"):
+        try:
+            subprocess.Popen([launcher, MANUAL_URL],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("  (браузер открыт автоматически)")
+            break
+        except FileNotFoundError:
+            continue
+
+    token = input("\n  Вставь токен: ").strip()
     if not token:
         print("  Токен не введён — выход.")
         sys.exit(1)
     _save_token(token)
-    print(f"  ✓ Сохранено в {TOKEN_FILE}")
+    print(f"\n  ✓ Сохранено → {TOKEN_FILE}")
     print()
 
 
