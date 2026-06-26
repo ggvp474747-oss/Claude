@@ -1,0 +1,52 @@
+name: Build Calculator APK
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: calculator-ios/package-lock.json
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install dependencies
+        working-directory: calculator-ios
+        run: npm install
+
+      - name: Generate Android project
+        working-directory: calculator-ios
+        run: npx expo prebuild --platform android --clean
+
+      - name: Set Android SDK path
+        run: echo "sdk.dir=$ANDROID_HOME" > calculator-ios/android/local.properties
+
+      - name: Make gradlew executable
+        run: chmod +x calculator-ios/android/gradlew
+
+      - name: Build Debug APK
+        working-directory: calculator-ios/android
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: calculator-debug-${{ github.run_number }}
+          path: calculator-ios/android/app/build/outputs/apk/debug/*.apk
+          retention-days: 7
