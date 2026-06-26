@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android APKs
 
 on:
   push:
@@ -9,13 +9,44 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build APK
+  discover:
+    name: Discover Android Projects
     runs-on: ubuntu-latest
+    outputs:
+      projects: ${{ steps.find.outputs.projects }}
+      has_projects: ${{ steps.find.outputs.has_projects }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find Android projects
+        id: find
+        run: |
+          projects=$(find . -path "*/app/src/main/AndroidManifest.xml" \
+            | sed 's|/app/src/main/AndroidManifest.xml||' \
+            | sed 's|^\./||' \
+            | jq -R . | jq -s -c .)
+          echo "projects=$projects" >> $GITHUB_OUTPUT
+          if [ "$projects" = "[]" ]; then
+            echo "has_projects=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_projects=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Print discovered projects
+        run: echo "Found projects: ${{ steps.find.outputs.projects }}"
+
+  build:
+    name: Build ${{ matrix.project }}
+    needs: discover
+    if: needs.discover.outputs.has_projects == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.discover.outputs.projects) }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -29,21 +60,25 @@ jobs:
           gradle-version: '8.6'
 
       - name: Set Android SDK path
-        run: echo "sdk.dir=$ANDROID_HOME" > android-calculator/local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > ${{ matrix.project }}/local.properties
+
+      - name: Sanitize project name for artifact
+        id: name
+        run: echo "safe=$(echo '${{ matrix.project }}' | tr '/' '-')" >> $GITHUB_OUTPUT
 
       - name: Build Debug APK
-        working-directory: android-calculator
+        working-directory: ${{ matrix.project }}
         run: gradle assembleDebug
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: calculator-debug-${{ github.run_number }}
-          path: android-calculator/app/build/outputs/apk/debug/*.apk
+          name: ${{ steps.name.outputs.safe }}-debug-${{ github.run_number }}
+          path: ${{ matrix.project }}/app/build/outputs/apk/debug/*.apk
           retention-days: 7
 
       - name: Build Release APK
-        working-directory: android-calculator
+        working-directory: ${{ matrix.project }}
         run: gradle assembleRelease
 
       - name: Sign Release APK
@@ -55,7 +90,7 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           echo "$KEYSTORE_BASE64" | base64 --decode > /tmp/keystore.jks
-          APK_PATH=$(find android-calculator/app/build/outputs/apk/release -name "*.apk" | head -1)
+          APK_PATH=$(find ${{ matrix.project }}/app/build/outputs/apk/release -name "*.apk" | head -1)
           BUILD_TOOLS=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
           "$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner" sign \
             --ks /tmp/keystore.jks \
@@ -70,13 +105,13 @@ jobs:
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: calculator-release-${{ github.run_number }}
-          path: android-calculator/app/build/outputs/apk/release/*.apk
+          name: ${{ steps.name.outputs.safe }}-release-${{ github.run_number }}
+          path: ${{ matrix.project }}/app/build/outputs/apk/release/*.apk
           retention-days: 30
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: android-calculator/app/build/outputs/apk/release/*.apk
+          files: ${{ matrix.project }}/app/build/outputs/apk/release/*.apk
           generate_release_notes: true
